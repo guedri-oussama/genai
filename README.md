@@ -61,7 +61,7 @@ gen_project/
 
 ## 🚀 Installation et Démarrage
 
-### 1. Configuration
+### 1. Configuratio : 
 ```bash
 # Cloner le projet
 git clone [https://github.com/guedri-oussama/genai.git](https://github.com/guedri-oussama/genai.git)
