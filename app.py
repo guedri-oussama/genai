@@ -37,17 +37,32 @@ OLLAMA_MODEL    = "qwen2.5:3b"
 # Prompt unique : redaction de la reponse
 # =============================================
 RESPONSE_PROMPT = """\
-Tu es un expert du Reglement europeen sur l'Intelligence Artificielle \
+Tu es un assistant expert du Reglement europeen sur l'Intelligence Artificielle \
 (AI Act, Reglement UE 2024/1689). Reponds en francais.
 
 REGLES :
-1. Base ta reponse UNIQUEMENT sur le contexte fourni ci-dessous.
-2. Cite les articles et considerants exacts (ex: "Article 6, paragraphe 2").
+1. Base ta reponse sur le contexte fourni ET sur l'historique de conversation.
+2. Quand le contexte vient du AI Act, cite les articles et considerants exacts \
+   (ex: "Article 6, paragraphe 2").
 3. Si le contexte contient des obligations ou interdictions, LISTE-LES precisement.
-4. Si le contexte vient d'internet, PRECISE-LE clairement.
+4. Si le contexte vient d'internet, PRECISE-LE clairement et reponds normalement \
+   sans forcer de lien avec le AI Act.
 5. Ne dis JAMAIS "consultez le texte complet" ou "je n'ai pas assez d'info".
    Utilise ce que tu as et reponds du mieux possible.
 6. Structure ta reponse avec des titres et des puces si necessaire.
+7. Tu as acces a l'historique de conversation. Si l'utilisateur fait reference \
+   a un echange precedent (un prenom, un sujet, une personne), utilise l'historique \
+   pour repondre. Ne dis JAMAIS "je ne sais pas" si l'info est dans l'historique.
+8. Si l'utilisateur demande un RESUME ou une EXPLICATION d'un article ou considerant, \
+   fournis un resume synthetique, pas le texte integral.
+9. Pour les questions sans rapport avec le AI Act (blagues, culture generale, etc.), \
+   reponds normalement sans forcer de lien avec le reglement.
+10. Si on te demande de repondre avec tes propres connaissances et que tu ne connais \
+    PAS la reponse ou que tes informations sont trop vagues/incertaines, reponds \
+    EXACTEMENT avec le marqueur [RECHERCHE_WEB] sur la premiere ligne, suivi d'une \
+    breve explication de ce que tu cherches. Exemple :
+    [RECHERCHE_WEB]
+    Je n'ai pas d'information fiable sur ce sujet.
 """
 
 # =============================================
@@ -127,6 +142,8 @@ def get_sources(docs):
             label = f"Article {m['article']} : {m['title']}"
             if m.get("chapter"):
                 label = f"Chapitre {m['chapter']} > {label}"
+        elif m.get("type") == "annexe":
+            label = f"Annexe {m['annexe']} : {m['title']}"
         else:
             label = m.get("title", "Considerant")
         sources.append(label)
@@ -157,52 +174,21 @@ def get_chat_history() -> InMemoryChatMessageHistory:
     return st.session_state.chat_history
 
 
-def is_followup(question: str) -> bool:
-    """
-    Detecte si la question fait reference a la conversation precedente.
-    Combine 2 signaux :
-    1. Mots-cles de reference explicite (ci-dessus, precedent, ta reponse)
-    2. Verbes d'action sur contenu implicite (resume, explique, continue)
-
-    N'utilise PAS la longueur de la question (trop de faux positifs).
-    """
-    q = question.lower().strip()
-
-    # Signal 1 : references explicites au contexte precedent
-    explicit = [
-        r"\bci.?dessus\b", r"\bprecedent\b", r"\bplus haut\b",
-        r"\bta reponse\b", r"\bton analyse\b", r"\bce que tu\b",
-        r"\bces articles\b", r"\bces resultats\b", r"\bces points\b",
-        r"\bcette liste\b", r"\bce tableau\b", r"\bce texte\b",
-    ]
-    if any(re.search(p, q) for p in explicit):
-        return True
-
-    # Signal 2 : verbe d'action EN DEBUT de phrase sur contenu implicite
-    action_start = [
-        r"^(resume|syntheti|explique|detaille|developpe|precise|reformule|tradui)",
-        r"^(continue|poursui|complete|approfondi)",
-        r"^(et\s+(pour|qu|si|le|la|les|en)\b)",
-    ]
-    if any(re.search(p, q) for p in action_start):
-        return True
-
-    return False
-
 
 def call_llm(question: str, context: str, context_label: str = "AI Act") -> str:
     """
-    Appel LLM avec memoire CONDITIONNELLE :
-    - Si la question est un suivi → historique inclus
-    - Sinon → juste le contexte
+    Appel LLM avec memoire SYSTEMATIQUE :
+    L'historique (6 derniers messages) est TOUJOURS envoye au LLM.
+    Le LLM est assez intelligent pour ignorer l'historique quand il n'est pas pertinent.
 
     ChatOllama (local) et ChatGroq (cloud) utilisent tous les deux
     l'interface LangChain standard → meme code, zero branchement.
     """
     messages = [SystemMessage(content=RESPONSE_PROMPT)]
 
-    if is_followup(question):
-        history = get_chat_history()
+    # Toujours inclure l'historique (le LLM saura quoi en faire)
+    history = get_chat_history()
+    if history.messages:
         for msg in history.messages[-6:]:
             content = msg.content[:800] + "..." if len(msg.content) > 800 else msg.content
             messages.append(type(msg)(content=content))
@@ -230,6 +216,29 @@ def call_llm(question: str, context: str, context_label: str = "AI Act") -> str:
             raise RuntimeError(f"Erreur LLM : {error_msg}") from e
 
 
+def _direct_or_llm(docs, question: str, wants_analysis: bool, label: str) -> dict:
+    """
+    Si l'utilisateur veut juste le texte (ex: "article 5") → retour direct.
+    Si l'utilisateur veut un resume/explication → passer le texte au LLM.
+    """
+    sources = get_sources(docs)
+    context = format_docs(docs)
+    if wants_analysis:
+        if len(context) > 4000:
+            context = context[:4000] + "\n\n[... tronque ...]"
+        response_text = call_llm(question, context, f"AI Act — {label}")
+        return {
+            "response": response_text,
+            "sources": sources,
+            "mode": f"{label} (analyse LLM)",
+        }
+    return {
+        "response": context,
+        "sources": sources,
+        "mode": f"{label} (texte integral)",
+    }
+
+
 def process_question(question: str) -> dict:
     """
     Decide du traitement par du CODE PYTHON (pas par le LLM).
@@ -242,28 +251,88 @@ def process_question(question: str) -> dict:
     q = question.lower()
 
     # ========================================
-    # MODE 1 : DIRECT — regex article/considerant (0 appel LLM)
+    # Detection : l'utilisateur veut-il un RESUME/EXPLICATION ?
+    # Si oui, on passe par le LLM meme pour un article/considerant precis.
     # ========================================
-    art = re.search(r"article\s+(premier|\d+)", q)
-    if art:
-        num = "1" if art.group(1) == "premier" else art.group(1)
-        docs = docstore_lookup(db, {"article": num})
-        if docs:
-            return {
-                "response": format_docs(docs),
-                "sources": get_sources(docs),
-                "mode": f"Article {num} (texte integral)",
-            }
+    wants_analysis = bool(re.search(
+        r"(r[eé]sum|synth[eé]|explique|compar|analys|simplifie|vulgar|tradui|"
+        r"d[eé]taille|d[eé]veloppe|pr[eé]cise|reformule|"
+        r"en quoi|que signifie|que veut dire|qu.?est.ce que|comment)",
+        q
+    ))
 
-    cons = re.search(r"consid[ée]rant\s+(\d+)", q)
-    if cons:
-        docs = docstore_lookup(db, {"type": "considerant", "numero": f"({cons.group(1)})"})
-        if docs:
-            return {
-                "response": docs[0].page_content,
-                "sources": get_sources(docs),
-                "mode": f"Considerant {cons.group(1)} (texte integral)",
-            }
+    # ========================================
+    # MODE 1 : DIRECT — regex article/considerant/annexe (0 appel LLM)
+    # Supporte : "article 5", "articles 5 et 8", "articles 5 à 8",
+    #            "considérant 12", "considérants 1 et 2",
+    #            "annexe III", "annexes I et IV"
+    # Si wants_analysis=True, on passe le texte au LLM pour synthese.
+    # ========================================
+
+    # --- Articles : plage (5 à 8) ---
+    range_match = re.search(r"articles?\s+(\d+)\s+[àa]\s+(\d+)", q)
+    if range_match:
+        start, end = int(range_match.group(1)), int(range_match.group(2))
+        all_docs = []
+        nums = []
+        for n in range(start, min(end + 1, start + 20)):  # max 20 articles
+            docs = docstore_lookup(db, {"article": str(n)})
+            if docs:
+                all_docs.extend(docs)
+                nums.append(str(n))
+        if all_docs:
+            return _direct_or_llm(all_docs, question, wants_analysis,
+                                  f"Articles {', '.join(nums)}")
+
+    # --- Articles : un ou plusieurs (5, "5 et 8", "5, 8 et 12") ---
+    # Etape 1 : capturer le bloc "article(s) 5 et 8" ou "art. 5, 8 et 12"
+    art_block = re.search(
+        r"(?:articles?|art\.?)\s+((?:premier|\d+)(?:\s*(?:,|et)\s*(?:premier|\d+))*)",
+        q
+    )
+    art_matches = re.findall(r"(premier|\d+)", art_block.group(1)) if art_block else []
+    if art_matches:
+        all_docs = []
+        nums = []
+        for m in art_matches:
+            num = "1" if m == "premier" else m
+            if num not in nums:  # eviter les doublons
+                nums.append(num)
+                docs = docstore_lookup(db, {"article": num})
+                all_docs.extend(docs)
+        if all_docs:
+            return _direct_or_llm(all_docs, question, wants_analysis,
+                                  f"Article{'s' if len(nums) > 1 else ''} {', '.join(nums)}")
+
+    # --- Considerants : un ou plusieurs ("considérants 1 et 2", "considérants 1, 2 et 3") ---
+    cons_block = re.search(
+        r"consid[ée]rants?\s+((?:\d+)(?:\s*(?:,|et)\s*\d+)*)",
+        q
+    )
+    cons_matches = re.findall(r"(\d+)", cons_block.group(1)) if cons_block else []
+    if cons_matches:
+        all_docs = []
+        for num in cons_matches:
+            docs = docstore_lookup(db, {"type": "considerant", "numero": f"({num})"})
+            all_docs.extend(docs)
+        if all_docs:
+            return _direct_or_llm(all_docs, question, wants_analysis,
+                                  f"Considerant{'s' if len(cons_matches) > 1 else ''} {', '.join(cons_matches)}")
+
+    # --- Annexes : une ou plusieurs (annexe III, annexes I et IV) ---
+    annexe_matches = re.findall(r"annexe\s+([IVXLC]+|\d+)", q, re.IGNORECASE)
+    if annexe_matches:
+        all_docs = []
+        nums = []
+        for num in annexe_matches:
+            num_upper = num.upper()
+            if num_upper not in nums:
+                nums.append(num_upper)
+                docs = docstore_lookup(db, {"type": "annexe", "annexe": num_upper})
+                all_docs.extend(docs)
+        if all_docs:
+            return _direct_or_llm(all_docs, question, wants_analysis,
+                                  f"Annexe{'s' if len(nums) > 1 else ''} {', '.join(nums)}")
 
     # ========================================
     # MODE 2 : RAG — recherche semantique FAISS + LLM avec historique
@@ -287,8 +356,68 @@ def process_question(question: str) -> dict:
         }
 
     # ========================================
-    # MODE 3 : WEB — DuckDuckGo + LLM (1 appel LLM)
-    # On fait 2 recherches (FR + EN) pour maximiser les resultats
+    # MODE 2bis : CONVERSATION — question de suivi ou courte reference
+    # Si l'historique existe et que la question semble etre un suivi,
+    # on repond avec le LLM + historique SANS chercher sur internet.
+    # Evite que "etait-il un peintre aussi?" cherche sur DuckDuckGo
+    # et retourne un resultat sans rapport.
+    # ========================================
+    history = get_chat_history()
+    if history.messages:
+        is_short = len(question.split()) < 15
+        has_pronoun = bool(re.search(
+            r"\b(il|elle|ils|elles|lui|son|sa|ses|leur|ce|cet|cette|ces|"
+            r"le meme|la meme|aussi|[eé]galement|en plus|de plus|"
+            r"je m.appelle|mon nom|comment je|qui suis|quel |sur quel|"
+            r"a.?t.?il|a.?t.?elle|est.?il|est.?elle|[eé]tait.?il|[eé]tait.?elle|"
+            r"le pr[eé]c[eé]dent|ci.?dessus|plus haut|ta r[eé]ponse)\b",
+            q
+        ))
+        # Verbe d'action en debut de phrase courte = reference implicite
+        # "resume le", "explique ca", "detaille", "continue"
+        action_followup = bool(re.match(
+            r"^(r[eé]sum|synth[eé]|explique|d[eé]taille|d[eé]veloppe|pr[eé]cise|"
+            r"reformule|tradui|simplifie|continue|poursui|compl[eè]te|approfondi|"
+            r"r[eé]p[eè]te|redis|relis)",
+            q
+        ))
+        if is_short and (has_pronoun or action_followup):
+            response_text = call_llm(
+                question,
+                "Pas de contexte supplementaire. Reponds en utilisant l'historique de conversation.",
+                "Conversation (historique)",
+            )
+            return {
+                "response": response_text,
+                "sources": [],
+                "mode": "Conversation (memoire)",
+            }
+
+    # ========================================
+    # MODE 3 : LLM SEUL — connaissances propres du modele
+    # Le LLM repond avec ses connaissances. S'il ne sait pas,
+    # il repond [RECHERCHE_WEB] → on declenche DuckDuckGo.
+    # ========================================
+    response_text = call_llm(
+        question,
+        "Aucun document pertinent dans la base AI Act. "
+        "Reponds avec tes propres connaissances. "
+        "Si tu ne connais PAS la reponse ou que tu n'es pas sur, "
+        "reponds EXACTEMENT [RECHERCHE_WEB] sur la premiere ligne.",
+        "Connaissances du modele",
+    )
+
+    # Si le LLM sait repondre → on retourne sa reponse
+    if "[RECHERCHE_WEB]" not in response_text:
+        return {
+            "response": response_text,
+            "sources": ["Connaissances du modele"],
+            "mode": "LLM (connaissances propres)",
+        }
+
+    # ========================================
+    # MODE 4 : WEB — DuckDuckGo + LLM (1 appel LLM)
+    # Declenche UNIQUEMENT si le LLM a dit [RECHERCHE_WEB]
     # ========================================
     search = DuckDuckGoSearchRun()
     web_parts = []
@@ -299,7 +428,6 @@ def process_question(question: str) -> dict:
     except Exception:
         pass
     try:
-        # Recherche en anglais (souvent meilleurs resultats)
         r_en = search.invoke(question + " results 2025")
         if r_en:
             web_parts.append(r_en)
@@ -323,7 +451,8 @@ def process_question(question: str) -> dict:
     # FALLBACK : rien trouve nulle part
     # ========================================
     return {
-        "response": "Je n'ai trouve aucune information pertinente, ni dans le AI Act ni sur internet.",
+        "response": "Je n'ai trouve aucune information pertinente, ni dans le AI Act, "
+                     "ni dans mes connaissances, ni sur internet.",
         "sources": [],
         "mode": "Aucun resultat",
     }
@@ -337,16 +466,20 @@ st.title("Expert AI Act (UE 2024/1689)")
 st.caption(f"RAG + DuckDuckGo — {LLM_LABEL}")
 
 with st.sidebar:
-    st.header("3 modes automatiques")
+    st.header("4 modes automatiques")
     st.markdown(
-        "**Direct** : article ou considerant mot a mot\n\n"
-        "**RAG** : recherche semantique + reponse IA\n\n"
-        "**Web** : recherche internet si hors AI Act\n\n"
+        "**1. Direct** : article, considerant ou annexe mot a mot\n\n"
+        "**2. RAG** : recherche semantique dans le AI Act + reponse IA\n\n"
+        "**3. LLM** : connaissances propres du modele\n\n"
+        "**4. Web** : recherche internet (si le LLM ne sait pas)\n\n"
         "---\n"
         "Exemples :\n"
         "- *Donne-moi l'article 5*\n"
-        "- *Que dit le considerant 12 ?*\n"
+        "- *Articles 5 et 8*\n"
+        "- *Resume le considerant 12*\n"
+        "- *Annexe III*\n"
         "- *Je recrute par IA, suis-je conforme ?*\n"
+        "- *Qui est Emmanuel Macron ?*\n"
         "- *Qui a gagne Paris-Roubaix ?*"
     )
 
